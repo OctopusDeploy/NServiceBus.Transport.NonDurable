@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Transport;
 
@@ -404,17 +405,21 @@ class NonDurableMessagePump(
 
     static async ValueTask<BrokerEnvelope?> DequeueForProcessingAsync(NonDurableChannel queue, CancellationToken cancellationToken)
     {
-        while (await queue.WaitToRead(cancellationToken).ConfigureAwait(false))
+        // ReadAsync hands the message to exactly one blocked reader. WaitToRead/TryRead instead signals
+        // readiness to every parked reader, so a single enqueue wakes all MaxConcurrency pump loops to
+        // race for one item — a thundering herd whose cost scales with concurrency.
+        try
         {
 #pragma warning disable CA2000 // ownership is transferred to the caller
-            if (queue.TryDequeue(out var envelope))
+            return await queue.Dequeue(cancellationToken).ConfigureAwait(false);
 #pragma warning restore CA2000
-            {
-                return envelope;
-            }
         }
-
-        return null;
+        catch (ChannelClosedException)
+        {
+            // Channel completed and drained (broker disposal): mirrors the previous WaitToRead returning
+            // false, signalling the caller to stop the pump loop.
+            return null;
+        }
     }
 
     async Task<bool> WaitForRetryOrStopAsync(TimeSpan retryAfter, TimeProvider timeProvider, CancellationToken cancellationToken)
